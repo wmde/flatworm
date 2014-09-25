@@ -1,0 +1,3 @@
+Script for flattening parent categories of articles to make categories recursively searchable in elasticsearch.
+Currently used for testing on a single elasticsearch/mediawiki/graphserv host. Don't use this if you're not me.
+ -J.
