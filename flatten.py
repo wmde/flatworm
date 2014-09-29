@@ -6,6 +6,7 @@ import pprint
 import traceback
 import MySQLdb
 import elasticsearch
+import elasticsearch.helpers
 from gp import client
 
 EL_HOST="localhost"
@@ -17,6 +18,10 @@ GP_GRAPH="gptest1wiki"
 SQL_HOST="localhost"
 SQL_PORT=3306
 SQL_DB="gptest1wiki"
+
+BULK_ENABLED=False
+BULK_CHUNK_SIZE=500
+TARGET_FIELD="parent_categories"
 
 pp= pprint.PrettyPrinter(indent=2)
 
@@ -39,15 +44,38 @@ def getParentcats(categories, gp, cursor):
                     totalcats[str(cat[0])]= cat[1]+1
     return totalcats
 
+# from http://stackoverflow.com/questions/1038824
+def strip_suffix(text, suffix):
+    if not text.endswith(suffix):
+        return text
+    return text[:len(text)-len(suffix)]
     
+def makeBulkUpdateAction(hit, gp, cursor):
+    if "category" in hit["fields"]:
+        parentcats= getParentcats(hit["fields"]["category"], gp, cursor)
+    else:
+        parentcats= dict()
+    #~ print("makeBulkUpdateAction: %s in index %s" % (hit["fields"]["title"], hit["_index"]))
+    parentcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
+    action= { 
+        "_op_type": "update",
+        "_index": strip_suffix(hit["_index"]),
+        "_type": "page",
+        "_id": hit["_id"],
+        "script": "ctx._source.%s= %s" % (TARGET_FIELD, str(parentcats))
+    }
+    return action
+
 def updateParents(hit, es, gp, cursor):
     #~ print "%s (%s) in index %s" % (hit["fields"]["title"], hit["_id"], hit["_index"])
     if "category" in hit["fields"]:
         totalcats= getParentcats(hit["fields"]["category"], gp, cursor)
     else:
         totalcats= dict()
-    body= { "script": "ctx._source.parent_categories= %s" % str(totalcats) }
-    es.update(index=hit["_index"], doc_type="page", id=hit["_id"], body=body)
+    totalcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
+    body= { "script": "ctx._source.remove(\"%s\"); ctx._source.%s= %s" % (TARGET_FIELD, TARGET_FIELD, str(totalcats)) }
+    #~ body= { "script": "ctx._source.remove(\"%s\")" % TARGET_FIELD }
+    es.update(index=strip_suffix(hit["_index"], "_first"), doc_type="page", id=hit["_id"], body=body)
 
 if __name__=='__main__':
     es= elasticsearch.Elasticsearch(hosts=[ { "host": EL_HOST, "port": EL_PORT } ])
@@ -57,24 +85,39 @@ if __name__=='__main__':
     sql= MySQLdb.connect(read_default_file=os.path.expanduser("~/.my.cnf"), host=SQL_HOST, port=SQL_PORT, db=SQL_DB)
     cursor= sql.cursor()
     
-    es.indices.put_mapping(index=EL_INDEX, doc_type="page", body= { "dynamic": "true" })
+    es.indices.put_mapping(index="_all", doc_type="page", body= { "dynamic": "true" })
     
-    scrollfrom= 0
+    res= es.count(index=EL_INDEX, doc_type="page", q="!_exists_:%s" % TARGET_FIELD)
+    count= res["count"]
+    
+    print("getting pages without '%s' field, approx. count: %s..." % (TARGET_FIELD, count))
+    scroll= elasticsearch.helpers.scan(es, doc_type="page", fields=["_id", "title", "category"], q="!_exists_:%s" % TARGET_FIELD)
     begintime= time.time()
-    while True:
-        iterbegintime= time.time()
-        res= es.search(index=EL_INDEX, doc_type="page", q="!_exists_:parent_categories", fields=["_id", "title", "category"], size=50, from_=scrollfrom)
-        if not len(res["hits"]["hits"]): 
-            break
-        for hit in res["hits"]["hits"]:
-            try:
-                updateParents(hit, es, gp, cursor)
-            except Exception as ex:
-                traceback.print_exc(file=sys.stdout)
-                print("exception caught, continuing...")
-        scrollfrom+= len(res["hits"]["hits"])
-        print(" * processed %s hits of %s at %.2f/sec (%.2f/sec)" % 
-            (scrollfrom, res["hits"]["total"], scrollfrom/(time.time()-begintime), len(res["hits"]["hits"])/(time.time()-iterbegintime)))
-        sys.stdout.flush()
-    
+    bulkactions= []
+    hits_processed= 0
+    for hit in scroll:
+        if BULK_ENABLED:
+            bulkactions.append(makeBulkUpdateAction(hit, gp, cursor))
+        else:
+            updateParents(hit, es, gp, cursor)
+            print "%5d/%d... (%.2f/sec.)               \r" % (hits_processed, count, hits_processed/(time.time()-begintime)), 
+        hits_processed+= 1
+        if len(bulkactions)==BULK_CHUNK_SIZE:
+            print(" * running bulk update...")
+            sys.stdout.flush();
+            r= elasticsearch.helpers.bulk(es, bulkactions, request_timeout=60*2)
+            print "   bulk result: ",
+            pp.pprint(r)
+            print(" * processed %s of approx %s hits at %.2f/sec" % 
+                (hits_processed, count, hits_processed/(time.time()-begintime)))
+            bulkactions= []
+    if len(bulkactions):
+        print(" * running bulk update...")
+        sys.stdout.flush();
+        r= elasticsearch.helpers.bulk(es, bulkactions, request_timeout=60*2)
+        print "   bulk result: ",
+        pp.pprint(r)
+        es.indices.flush(index="_all")
+        bulkactions= []
+    print("")
 
