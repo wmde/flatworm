@@ -72,7 +72,8 @@ def makeBulkUpdateAction(hit, gp, cursor, include_titles):
     else:
         parentcats= dict()
     #~ print("makeBulkUpdateAction: %s in index %s" % (hit["fields"]["title"], hit["_index"]))
-    parentcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
+    if len(parentcats)==0:
+        parentcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
     action= { 
         "_op_type": "update",
         "_index": strip_suffix(hit["_index"], "_first"),
@@ -88,7 +89,8 @@ def updateParents(hit, es, gp, cursor, include_titles):
         totalcats= getParentcats(hit["fields"]["category"], gp, cursor, include_titles)
     else:
         totalcats= dict()
-    totalcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
+    if len(parentcats)==0:
+        totalcats["dummy"]= 1   # we add this because empty dicts confuse elasticsearch, end up as empty lists in the index, and are ignored in "q=_exists_" searches...
     body= { "script": "ctx._source.remove(\"%s\"); ctx._source.%s= %s" % (TARGET_FIELD, TARGET_FIELD, str(totalcats)) }
     #~ body= { "script": "ctx._source.remove(\"%s\")" % TARGET_FIELD }
     es.update(index=strip_suffix(hit["_index"], "_first"), doc_type="page", id=hit["_id"], body=body)
